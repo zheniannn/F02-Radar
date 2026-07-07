@@ -51,6 +51,10 @@ def parse_args():
                          help="Base RNG seed; per-day/per-threshold children are derived via sha256 (default: 42).")
     parser.add_argument("--overwrite", action="store_true",
                          help="Regenerate outputs that already exist (default: skip them).")
+    parser.add_argument("--frame-period-s", type=float, default=10.0,
+                         help="Radar scan period: a frame is floor(timestamp / this) (default: 10, "
+                              "matching the stage-4 grid). Stage-4 timestamps are per-trajectory "
+                              "anchored, so frames must be binned, not grouped by raw timestamp.")
 
     snr = parser.add_argument_group("target SNR model")
     snr.add_argument("--snr-model", choices=["constant", "range_decay"], default="range_decay")
@@ -108,6 +112,7 @@ def main() -> None:
         scenario_id=args.scenario_id,
         seed=args.seed,
         overwrite=args.overwrite,
+        frame_period_s=args.frame_period_s,
         snr_model=args.snr_model,
         target_snr_ref_db=args.target_snr_ref_db,
         snr_ref_range_m=args.snr_ref_range_m,

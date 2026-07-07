@@ -193,9 +193,14 @@ clutter detections, total detections, false alarms per frame, and
 p10/median/p90 target SNR. Existing outputs are skipped with a clear
 message unless `--overwrite` is passed.
 
-A **frame** is a unique timestamp within a day (`frame_id` = stable index
-after ascending sort). Multiple aircraft can share a frame — no
-one-target-per-frame assumption anywhere.
+A **frame** is one radar scan: `floor(timestamp / --frame-period-s)`
+(default 10 s, matching the stage-4 grid), with `frame_id` the stable index
+of the sorted unique frames and the bin start as the frame's representative
+timestamp. Binning is essential — stage-4 timestamps are anchored at each
+trajectory's own first fix, so raw timestamps are *not* aligned across
+aircraft; grouping them directly would put almost every detection in its
+own "frame". Multiple aircraft share a frame — no one-target-per-frame
+assumption anywhere.
 
 ## Method
 

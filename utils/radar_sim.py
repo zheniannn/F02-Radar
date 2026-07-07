@@ -93,6 +93,12 @@ class RadarSimConfig:
     sigma_elevation_deg: float = 0.15
     sigma_radial_velocity_mps: float = 2.0
 
+    # Frames: one radar scan per frame_period_s. Stage-4 grids are anchored at
+    # each trajectory's own first fix, so raw timestamps are NOT aligned
+    # across aircraft -- binning by scan period is what makes "multiple
+    # aircraft in the same frame" (and per-frame clutter) meaningful.
+    frame_period_s: float = 10.0
+
     # Clutter model
     clutter_model: str = "poisson"
     clutter_rate_ref: float = 20.0           # expected false alarms/frame at the reference threshold
@@ -291,15 +297,26 @@ def simulate_day(date: str, input_path: str, output_dir: str, cfg: RadarSimConfi
     usecols = ["icao24", "trajectory_id", "source_segment_id", "sample_idx", "timestamp",
                "range_m", "azimuth_rad", "elevation_rad", "radial_velocity_mps", "radar_name"]
     usecols += RADAR_SITE_COLUMNS if has_site else []
-    df_truth = pd.read_csv(input_path, usecols=usecols,
-                           dtype={c: str for c in ["icao24", "trajectory_id", "source_segment_id"]},
-                           low_memory=False)
+    id_cols = ["icao24", "trajectory_id", "source_segment_id"]
+    # Chunked read + categorical ids keep peak memory well under the naive
+    # single-shot parse (the id strings dominate an object-dtype frame).
+    chunks = pd.read_csv(input_path, usecols=usecols, dtype={c: str for c in id_cols},
+                         chunksize=500_000)
+    df_truth = pd.concat(chunks, ignore_index=True)
+    for c in id_cols:
+        df_truth[c] = df_truth[c].astype("category")
 
-    # A frame is a unique timestamp within the day; frame_id is its stable
-    # index after ascending sort. Multiple aircraft share a frame.
-    unique_ts = np.sort(df_truth["timestamp"].unique())
-    frames = pd.DataFrame({"frame_id": np.arange(len(unique_ts)), "timestamp": unique_ts})
-    df_truth = df_truth.assign(frame_id=np.searchsorted(unique_ts, df_truth["timestamp"].to_numpy()))
+    # A frame is one radar scan: frame index = floor(timestamp / frame_period_s),
+    # frame_id = stable index of the sorted unique frames. Stage-4 timestamps
+    # are anchored per trajectory (not aligned across aircraft), so binning by
+    # scan period -- rather than grouping raw unique timestamps -- is what puts
+    # concurrent aircraft into the same frame. A frame's representative
+    # timestamp is its bin start. Multiple aircraft share a frame.
+    bins = np.floor(df_truth["timestamp"].to_numpy() / cfg.frame_period_s).astype(np.int64)
+    unique_bins = np.unique(bins)
+    frames = pd.DataFrame({"frame_id": np.arange(len(unique_bins)),
+                           "timestamp": unique_bins.astype(float) * cfg.frame_period_s})
+    df_truth["frame_id"] = np.searchsorted(unique_bins, bins)
 
     if cfg.max_range_m is not None:
         max_range_m = float(cfg.max_range_m)
@@ -500,6 +517,14 @@ def self_test() -> None:
                 "trajectory_duration_s": 40.0, "n_samples": 5,
             })
 
+    # Third trajectory with per-trajectory-anchored (misaligned) timestamps,
+    # like real stage-4 output: it must land in the SAME 5 frames as the
+    # others, not create 5 new ones (regression test for frame binning).
+    for i in range(5):
+        rows.append({**rows[i], "icao24": "cccccc", "trajectory_id": "ccc333_1000000_r0",
+                     "source_segment_id": "ccc333_1000000", "timestamp": t[i] + 0.37,
+                     "azimuth_rad": 1.0, "azimuth_deg": np.degrees(1.0)})
+
     cfg = RadarSimConfig(
         thresholds_db=[-5.0, 6.0, 12.0], seed=123,
         snr_model="constant", target_snr_ref_db=10.0, target_snr_std_db=3.0,
@@ -519,6 +544,8 @@ def self_test() -> None:
 
         for r in results:
             assert os.path.exists(r["output_file"]), f"missing output {r['output_file']}"
+            assert r["frames"] == 5, \
+                f"expected 5 frames (10s bins), got {r['frames']} -- frame binning broken"
         assert by_thr[-5.0]["empirical_pd"] >= by_thr[12.0]["empirical_pd"], \
             "empirical Pd catastrophically inverted across thresholds"
         assert by_thr[-5.0]["clutter_detections"] >= by_thr[12.0]["clutter_detections"], \
