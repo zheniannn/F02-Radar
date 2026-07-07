@@ -29,3 +29,15 @@ def get_radar_truth_dir() -> str:
 def get_radar_truth_summary_path(output_dir: str = "") -> str:
     """Path to the cross-day radar-truth summary CSV (kept next to the truth files)."""
     return os.path.join(output_dir or get_radar_truth_dir(), "radar_truth_summary.csv")
+
+
+# --- Stage 6 (06_simulate_radar_detections.py): truth -> thresholded point detections ---
+
+def get_sim_detections_dir() -> str:
+    """Directory for the per-day/per-threshold simulated detection CSVs and their summary."""
+    return os.path.join(get_repo_root(), "data", "active", "sim_detections")
+
+
+def get_sim_detection_summary_path(output_dir: str = "") -> str:
+    """Path to the cross-day simulation summary CSV (kept next to the detection files)."""
+    return os.path.join(output_dir or get_sim_detections_dir(), "sim_detection_summary.csv")

@@ -2,27 +2,45 @@
 
 Radar-side stages of the light-GA motion-prior pipeline. **F02-RADAR starts
 from F01-PREPROCESSING stage 4 outputs**: the uniformly-sampled (10 s grid)
-trajectory CSVs. Stage 5 re-expresses those trajectories relative to a
-fixed, user-supplied radar site.
+trajectory CSVs.
+
+Pipeline:
+
+```
+stage 4 trajectories (from F01)
+        │
+    05_make_radar_truth.py          radar-coordinate truth (noiseless)
+        │
+    06_simulate_radar_detections.py synthetic point detections under
+        ▼                           SNR / noise / clutter / thresholds
+data/active/sim_detections/detections_<date>_thr_<T>dB.csv
+```
 
 **Stage 5 produces noiseless radar-coordinate truth only.** It does not
-simulate anything. **Stage 6 will simulate radar measurements, noise,
-clutter, detection thresholds, and missed detections** on top of this truth.
+simulate anything. **Stage 6 simulates radar measurements at the
+point-detection level**: SNR-dependent missed detections, Gaussian
+measurement noise, and Poisson clutter under configurable thresholds — it
+is a synthetic point-detection simulation, **not** a raw radar simulation
+(no RF/IQ, pulse compression, or range-Doppler imaging; no tracking, model
+training, or train/test splitting — those belong to later stages).
 
 ## Structure
 
 ```
 F02-RADAR/
 ├── scripts/
-│   └── 05_make_radar_truth.py   # stage 5: 10s trajectories -> radar-coordinate truth
+│   ├── 05_make_radar_truth.py            # stage 5: 10s trajectories -> radar-coordinate truth
+│   └── 06_simulate_radar_detections.py   # stage 6: truth -> thresholded point detections
 ├── utils/
 │   ├── io.py                     # path resolution (repo-root relative)
 │   ├── geo.py                    # WGS84 geodetic -> ECEF -> ENU (numpy, no pymap3d)
-│   └── radar_truth.py            # stage 5 rules: discovery, conversion, filters, gate
+│   ├── radar_truth.py            # stage 5 rules: discovery, conversion, filters, gate
+│   └── radar_sim.py              # stage 6 rules: SNR/Pd model, noise, clutter, gate
 ├── data/
 │   └── active/
 │       ├── trajectories_10s/     # INPUT: stage-4 CSVs copied from F01 (git-ignored)
-│       └── radar_truth/          # OUTPUT: per-day truth CSVs + summary (git-ignored)
+│       ├── radar_truth/          # stage-5 output: per-day truth CSVs (git-ignored)
+│       └── sim_detections/       # stage-6 output: detection CSVs (git-ignored)
 └── reports/
 ```
 
@@ -140,8 +158,103 @@ temporary directory, and asserts the geometry (nonnegative finite range,
 bounded azimuth, monotonic timestamps, finite radial velocity, ENU speed
 ≈ 50 m/s, growing range when flying away). No real data is touched.
 
+---
+
+# Stage 6 — `06_simulate_radar_detections.py`
+
+Simulates **thresholded radar point detections** from stage 5's noiseless
+truth. Each output row is one detection after thresholding — either a noisy
+measurement of a real aircraft (`is_target = 1`, with truth metadata and
+per-component measurement errors) or a clutter false alarm
+(`is_target = 0`, with truth/identity fields NaN/blank). This is a
+**synthetic point-detection simulation, not a raw radar simulation** — no
+RF/IQ, pulse compression, or range-Doppler images.
+
+## Input contract from Stage 5
+
+One file per day, `radar_truth_YYYY-MM-DD.csv`, containing the stage-5
+output columns (identity/provenance, `timestamp`, `range_m`,
+`azimuth_rad`/`_deg`, `elevation_rad`/`_deg`, `ground_range_m`,
+`radial_velocity_mps`, ENU positions/velocities, and trajectory metadata).
+Stage 6 fails clearly if any required column is missing.
+
+## Outputs
+
+One file per day **per threshold**:
+
+```
+data/active/sim_detections/detections_YYYY-MM-DD_thr_<THRESHOLD>dB.csv
+    e.g. detections_2022-06-06_thr_6p0dB.csv   (-5 dB -> thr_m5p0dB)
+```
+
+plus `sim_detection_summary.csv` with one row per (day, threshold):
+truth rows, frames, target detections, missed targets, empirical Pd,
+clutter detections, total detections, false alarms per frame, and
+p10/median/p90 target SNR. Existing outputs are skipped with a clear
+message unless `--overwrite` is passed.
+
+A **frame** is a unique timestamp within a day (`frame_id` = stable index
+after ascending sort). Multiple aircraft can share a frame — no
+one-target-per-frame assumption anywhere.
+
+## Method
+
+Per truth row and threshold (`utils/radar_sim.py`):
+
+1. **SNR draw** — `range_decay` (default):
+   `snr = ref − 10·power·log10(range/ref_range) + N(0, std)` (the radar
+   equation in dB: with `power = 4`, SNR falls 12 dB per range doubling),
+   clamped to `[min, max]`, range clipped to ≥ 1 m before the log.
+   `constant`: `snr = ref + N(0, std)`.
+2. **Detection probability** — logistic in SNR vs threshold:
+   `pd = pd_min + (pd_max − pd_min) / (1 + exp(−(snr − thr)/width))`,
+   then a Bernoulli draw. Missed targets write no row.
+3. **Measurement noise** — Gaussian per component
+   (`--sigma-range-m 75`, `--sigma-azimuth-deg 0.15`,
+   `--sigma-elevation-deg 0.15`, `--sigma-radial-velocity-mps 2`); measured
+   range floored at 0, azimuth wrapped to [0, 2π), elevation clipped to
+   [−π/2, π/2]; per-component error columns recorded (azimuth error is
+   wrap-aware).
+4. **Clutter** — per frame, `n ~ Poisson(λ)` with
+   `λ = rate_ref · exp(−(thr − ref_thr)/scale)` (lower thresholds → more
+   false alarms); uniform in range/azimuth/elevation/radial velocity within
+   the configured bounds; SNR = threshold + Exponential(scale), since only
+   threshold-passing clutter is ever written. If `--max-range-m` is
+   omitted it is inferred per day from the truth's max range rounded up to
+   the nearest 10 km (printed clearly).
+5. **Reproducibility** — every (day, threshold) pair gets a child
+   `numpy.random.default_rng` seeded via sha256 of
+   (seed, date, threshold, scenario-id) — stable across processes and
+   run order (never Python's `hash()`).
+
+After all days, a **validation gate** checks: outputs created/skipped;
+required columns; `is_target` ∈ {0, 1}; measured range finite ≥ 0; azimuth
+in [0, 2π); elevation in [−π/2, π/2]; SNR finite; target rows have
+trajectory ids, finite truth range, and finite error columns; clutter rows
+have blank ids and NaN truth. Threshold trends (empirical Pd and false
+alarms per frame should generally decrease with threshold) are printed
+**report-only** — finite random samples may wiggle.
+
+## Usage
+
+```bash
+python scripts/06_simulate_radar_detections.py                      # defaults, thresholds -5..12
+python scripts/06_simulate_radar_detections.py --threshold-db 0 6 --scenario-id lowclutter \
+    --clutter-rate-ref 5 --overwrite
+python scripts/06_simulate_radar_detections.py --self-test          # tiny synthetic check
+```
+
+## Self-test
+
+`--self-test` builds a tiny synthetic truth file (two trajectories × five
+timestamps), simulates thresholds [−5, 6, 12] with a fixed seed and
+moderate clutter into a temporary directory, and asserts output existence,
+sane Pd/clutter ordering across thresholds, column completeness, valid
+labels, and bounded measurements. No real data is touched.
+
 ## Extending
 
-Stage-5 rules live entirely in `utils/radar_truth.py`; the WGS84 math is
-isolated in `utils/geo.py`. `io.py` and the entry-point script only need to
-change if the underlying file/folder layout changes.
+Stage-5 rules live entirely in `utils/radar_truth.py`, stage-6 rules in
+`utils/radar_sim.py`; the WGS84 math is isolated in `utils/geo.py`.
+`io.py` and the entry-point scripts only need to change if the underlying
+file/folder layout changes.
