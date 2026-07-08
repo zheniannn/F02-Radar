@@ -65,6 +65,31 @@ def parse_args():
                          help="Drop rows with elevation below 0 rad (default: keep them).")
     parser.add_argument("--overwrite", action="store_true",
                          help="Regenerate outputs that already exist (default: skip them).")
+
+    reloc = parser.add_argument_group(
+        "synthetic relocation (off by default; preserves each trajectory's motion/shape "
+        "but plants it near the radar -- output is then synthetic geography, not real)")
+    reloc.add_argument("--relocate-near-radar", action="store_true",
+                        help="Relocate every trajectory near the radar before generating truth.")
+    reloc.add_argument("--relocate-seed", type=int, default=42,
+                        help="Base seed; per-trajectory anchors derive via sha256 of "
+                             "(seed, date, trajectory_id, radar_name) (default: 42).")
+    reloc.add_argument("--relocate-min-ground-range-m", type=float, default=10_000.0,
+                        help="Anchor ground-range lower bound (default: 10000).")
+    reloc.add_argument("--relocate-max-ground-range-m", type=float, default=80_000.0,
+                        help="Anchor ground-range upper bound (default: 80000).")
+    reloc.add_argument("--relocate-min-bearing-deg", type=float, default=0.0,
+                        help="Anchor bearing lower bound in degrees (default: 0).")
+    reloc.add_argument("--relocate-max-bearing-deg", type=float, default=360.0,
+                        help="Anchor bearing upper bound in degrees (default: 360).")
+    reloc.add_argument("--relocate-anchor-altitude-mode", choices=["preserve", "fixed_up"],
+                        default="preserve",
+                        help="'preserve' (default): keep the original MSL altitude profile "
+                             "(up = original_alt - radar_alt). 'fixed_up': first point at "
+                             "--relocate-fixed-up-m, original vertical displacements preserved.")
+    reloc.add_argument("--relocate-fixed-up-m", type=float, default=1500.0,
+                        help="First-point height above the radar in fixed_up mode (default: 1500).")
+
     parser.add_argument("--self-test", action="store_true",
                          help="Run a tiny synthetic end-to-end check (no real data needed) and exit.")
     args = parser.parse_args()
@@ -91,7 +116,21 @@ def main() -> None:
         max_range_m=args.max_range_m,
         drop_below_horizon=args.drop_below_horizon,
         overwrite=args.overwrite,
+        relocate=args.relocate_near_radar,
+        relocate_seed=args.relocate_seed,
+        relocate_min_ground_range_m=args.relocate_min_ground_range_m,
+        relocate_max_ground_range_m=args.relocate_max_ground_range_m,
+        relocate_min_bearing_deg=args.relocate_min_bearing_deg,
+        relocate_max_bearing_deg=args.relocate_max_bearing_deg,
+        relocate_anchor_altitude_mode=args.relocate_anchor_altitude_mode,
+        relocate_fixed_up_m=args.relocate_fixed_up_m,
     )
+    if cfg.relocate:
+        print(f"Synthetic relocation ENABLED: anchors at {cfg.relocate_min_ground_range_m:.0f}-"
+              f"{cfg.relocate_max_ground_range_m:.0f} m ground range, bearings "
+              f"{cfg.relocate_min_bearing_deg:g}-{cfg.relocate_max_bearing_deg:g} deg, "
+              f"altitude mode '{cfg.relocate_anchor_altitude_mode}', seed {cfg.relocate_seed}. "
+              f"Output geography is SYNTHETIC.")
 
     input_dir = args.input_dir or get_trajectories_dir()
     output_dir = args.output_dir or get_radar_truth_dir()
@@ -127,7 +166,7 @@ def main() -> None:
     summary_df.to_csv(summary_path, index=False)
     print(f"\nSummary written to: {os.path.abspath(summary_path)}")
 
-    run_validation_gate(day_results)
+    run_validation_gate(day_results, cfg)
 
     print("\n05_make_radar_truth completed successfully.")
 

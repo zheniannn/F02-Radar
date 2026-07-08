@@ -94,7 +94,9 @@ CLI flags: `--radar-lat` / `--radar-lon` (required), `--radar-alt-m`
 `--max-range-m` (default: no limit), `--drop-below-horizon` (off by
 default), `--overwrite` (existing outputs are skipped with a clear message
 unless passed), `--input-dir` (default: `data/active/trajectories_10s`),
-`--output-dir` (default: `data/active/radar_truth`).
+`--output-dir` (default: `data/active/radar_truth`), plus the optional
+`--relocate-*` flags (off by default; see "Synthetic relocation near
+radar" below).
 
 - **Output:** `data/active/radar_truth/radar_truth_YYYY-MM-DD.csv`, one per
   day, plus `radar_truth_summary.csv` (one row per day, reporting rows
@@ -144,7 +146,56 @@ present; `range_m` finite and ≥ 0; azimuth in [0, 2π); elevation in
 [−π/2, π/2]; per-trajectory timestamps monotonic increasing. The median
 |`speed_enu_mps` − `speed_stage4_mps`| is printed report-only (hard failure
 only above 20 m/s), followed by a report-only p50/p95/p99 table for range,
-ground range, |radial velocity|, ENU speed, and elevation.
+ground range, |radial velocity|, ENU speed, and elevation. When relocation
+is enabled, the gate additionally verifies `relocated == 1`, finite
+original geography and anchors, and that every trajectory's first-point
+ground range lies within the configured anchor bounds (checked via the
+per-trajectory anchor columns, so row filtering can't hide a violation),
+plus a report-only first-point ground-range percentile line.
+
+## Synthetic relocation near radar
+
+By default, stage 5 uses **true ADS-B geography**. With
+`--relocate-near-radar`, each trajectory's **motion/shape is preserved but
+its absolute location is moved near the radar**: a deterministic anchor is
+drawn per trajectory (ground range ~ U[`--relocate-min-ground-range-m`,
+`--relocate-max-ground-range-m`], bearing ~ U[`--relocate-min-bearing-deg`,
+`--relocate-max-bearing-deg`], seeded via sha256 of
+(`--relocate-seed`, date, trajectory_id, radar name) — stable across runs
+and processes), and the trajectory's ENU offsets relative to its own first
+point are re-planted on that anchor. This is intended for **controlled
+radar simulation and target injection**; the resulting `lat_deg` /
+`lon_deg` / `alt_m` are *synthetic* coordinates derived from the relocated
+ENU and **must not be interpreted as real aircraft geography**. The true
+positions are always preserved in `original_lat_deg` / `original_lon_deg` /
+`original_alt_m`, alongside `relocated` (0/1) and per-trajectory
+`relocation_anchor_*` / `relocation_delta_*` provenance columns (NaN when
+relocation is off).
+
+Altitude handling (`--relocate-anchor-altitude-mode`): `preserve` (default)
+keeps each trajectory's original MSL altitude profile relative to the radar
+altitude (`up = original_alt − radar_alt`) — realistic GA
+cruise/climb/descent without needing terrain; `fixed_up` puts the first
+point at `--relocate-fixed-up-m` above the radar and preserves the original
+vertical displacement profile from there.
+
+Velocities, range/azimuth/elevation, and radial velocity are all computed
+from the **relocated** ENU coordinates, so downstream consumers see a fully
+consistent radar frame. **Caution:** `--min-range-m`, `--max-range-m`, and
+`--drop-below-horizon` are applied **after** relocation. Stage 6 should use
+relocated stage-5 outputs if the experiment assumes all aircraft are within
+radar coverage.
+
+```bash
+python scripts/05_make_radar_truth.py \
+  --radar-lat <LAT> \
+  --radar-lon <LON> \
+  --radar-alt-m <ALT> \
+  --relocate-near-radar \
+  --relocate-min-ground-range-m 10000 \
+  --relocate-max-ground-range-m 80000 \
+  --overwrite
+```
 
 ## Self-test
 
@@ -156,7 +207,12 @@ Builds a tiny synthetic stage-4-like file (one 5-point trajectory flying
 east at ~50 m/s near a radar at 45°N 7°E), runs the full stage into a
 temporary directory, and asserts the geometry (nonnegative finite range,
 bounded azimuth, monotonic timestamps, finite radial velocity, ENU speed
-≈ 50 m/s, growing range when flying away). No real data is touched.
+≈ 50 m/s, growing range when flying away). A second branch then moves the
+same trajectory ~7,000 km away, confirms it really is that far without
+relocation, and re-runs with `--relocate-near-radar` bounds of 20–30 km —
+asserting the relocated first point lands inside those bounds, the motion
+is still ~50 m/s, the original geography is preserved in `original_*`, and
+the synthetic coordinates sit near the radar. No real data is touched.
 
 ---
 

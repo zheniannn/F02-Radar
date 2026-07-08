@@ -10,6 +10,7 @@ respect to the radar origin, using exact WGS84 geometry (see utils/geo.py).
 The radar location is never invented: it must arrive via the CLI.
 """
 
+import hashlib
 import os
 import re
 import tempfile
@@ -19,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from utils.geo import geodetic_to_enu, wrap_angle_2pi
+from utils.geo import enu_to_geodetic, geodetic_to_enu, wrap_angle_2pi
 
 INPUT_PREFIX = "states_"
 INPUT_SUFFIX = "_conventionalGA_trajectories_10s.csv"
@@ -57,6 +58,18 @@ class RadarTruthConfig:
     max_range_m: Optional[float] = None
     drop_below_horizon: bool = False
     overwrite: bool = False
+
+    # Synthetic relocation (OFF by default -- default behavior is unchanged):
+    # preserve each trajectory's motion/shape but move it near the radar.
+    # See relocate_near_radar() for exact semantics.
+    relocate: bool = False
+    relocate_seed: int = 42
+    relocate_min_ground_range_m: float = 10_000.0
+    relocate_max_ground_range_m: float = 80_000.0
+    relocate_min_bearing_deg: float = 0.0
+    relocate_max_bearing_deg: float = 360.0
+    relocate_anchor_altitude_mode: str = "preserve"   # "preserve" | "fixed_up"
+    relocate_fixed_up_m: float = 1500.0               # used only in fixed_up mode
 
 
 # =============================================================================
@@ -129,6 +142,92 @@ def compute_trajectory_velocities(df: pd.DataFrame, east, north, up):
     return ve, vn, vu
 
 
+def derive_relocation_seed(base_seed: int, date: str, trajectory_id: str, radar_name: str) -> int:
+    """Deterministic 64-bit child seed per trajectory. sha256-based so it's
+    stable across processes and platforms (never Python's hash())."""
+    key = f"{base_seed}|{date}|{trajectory_id}|{radar_name}".encode()
+    return int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
+
+
+def relocate_near_radar(df: pd.DataFrame, lat, lon, alt, date: str, cfg: RadarTruthConfig):
+    """Synthetically relocate every trajectory near the radar, preserving its
+    motion/shape.
+
+    Per trajectory: a deterministic anchor is drawn (ground range ~
+    U[relocate_min, relocate_max], bearing ~ U[min, max]); the trajectory's
+    horizontal shape -- its ENU east/north offsets relative to its own first
+    point -- is re-planted on that anchor. Vertical handling:
+
+      * "preserve" (default): up_i = original_alt_i - radar_alt, i.e. the
+        original MSL altitude profile is kept relative to the radar altitude
+        (NOT the curvature-affected ENU up component).
+      * "fixed_up": up_i = relocate_fixed_up_m + (alt_i - alt_first), i.e.
+        the first point sits at the fixed height and the original vertical
+        displacement profile is preserved.
+
+    relocation_delta_up_m is recorded as the altitude displacement
+    (alt_i - alt_first), consistent with what fixed_up mode applies.
+
+    Returns (east, north, up, syn_lat, syn_lon, syn_alt,
+             anchor_e, anchor_n, anchor_u, delta_e, delta_n, delta_u),
+    where syn_* are the synthetic geodetic coordinates of the relocated
+    points (derived from the relocated ENU, so all outputs stay consistent).
+    """
+    n = len(df)
+    east = np.empty(n)
+    north = np.empty(n)
+    up = np.empty(n)
+    anchor_e = np.empty(n)
+    anchor_n = np.empty(n)
+    anchor_u = np.empty(n)
+    delta_e = np.empty(n)
+    delta_n = np.empty(n)
+    delta_u = np.empty(n)
+
+    min_bearing = np.radians(cfg.relocate_min_bearing_deg)
+    max_bearing = np.radians(cfg.relocate_max_bearing_deg)
+
+    for trajectory_id, pos in df.groupby("trajectory_id", sort=False).indices.items():
+        rng = np.random.default_rng(
+            derive_relocation_seed(cfg.relocate_seed, date, str(trajectory_id), cfg.radar_name))
+        ground_range = rng.uniform(cfg.relocate_min_ground_range_m, cfg.relocate_max_ground_range_m)
+        bearing = rng.uniform(min_bearing, max_bearing)
+        ae = ground_range * np.sin(bearing)
+        an = ground_range * np.cos(bearing)
+
+        la, lo, al = lat[pos], lon[pos], alt[pos]
+        # Horizontal shape: ENU offsets relative to the trajectory's own first point.
+        de, dn, _ = geodetic_to_enu(la, lo, al, la[0], lo[0], al[0])
+        dv = al - al[0]   # vertical displacement profile (curvature-free)
+
+        if cfg.relocate_anchor_altitude_mode == "preserve":
+            u = al - cfg.radar_alt_m
+            au = al[0] - cfg.radar_alt_m
+        elif cfg.relocate_anchor_altitude_mode == "fixed_up":
+            u = cfg.relocate_fixed_up_m + dv
+            au = cfg.relocate_fixed_up_m
+        else:
+            raise ValueError(
+                f"Unknown relocate-anchor-altitude-mode '{cfg.relocate_anchor_altitude_mode}'")
+
+        east[pos] = ae + de
+        north[pos] = an + dn
+        up[pos] = u
+        anchor_e[pos] = ae
+        anchor_n[pos] = an
+        anchor_u[pos] = au
+        delta_e[pos] = de
+        delta_n[pos] = dn
+        delta_u[pos] = dv
+
+    # Synthetic geodetic coordinates of the relocated points, so lat/lon/alt
+    # in the output stay consistent with east/north/up.
+    syn_lat, syn_lon, syn_alt = enu_to_geodetic(
+        east, north, up, cfg.radar_lat, cfg.radar_lon, cfg.radar_alt_m)
+
+    return east, north, up, syn_lat, syn_lon, syn_alt, anchor_e, anchor_n, anchor_u, delta_e, delta_n, delta_u
+
+
 # =============================================================================
 # Per-day orchestration
 # =============================================================================
@@ -161,8 +260,22 @@ def make_radar_truth_for_day(date: str, input_path: str, output_dir: str, cfg: R
     lon = df[pos_cols[1]].to_numpy(dtype=float)
     alt = df[pos_cols[2]].to_numpy(dtype=float)
 
-    # Exact WGS84 geometry (no flat-earth approximation).
-    east, north, up = geodetic_to_enu(lat, lon, alt, cfg.radar_lat, cfg.radar_lon, cfg.radar_alt_m)
+    # The true ADS-B geography is always preserved in original_* columns,
+    # whether or not relocation rewrites the working lat/lon/alt below.
+    original_lat, original_lon, original_alt = lat, lon, alt
+
+    if cfg.relocate:
+        # Synthetic relocation: keep each trajectory's motion/shape, plant it
+        # near the radar. lat/lon/alt become synthetic coordinates derived
+        # from the relocated ENU. Exact WGS84 geometry throughout.
+        (east, north, up, lat, lon, alt,
+         anchor_e, anchor_n, anchor_u, delta_e, delta_n, delta_u) = relocate_near_radar(
+            df, lat, lon, alt, date, cfg)
+    else:
+        # Exact WGS84 geometry (no flat-earth approximation).
+        east, north, up = geodetic_to_enu(lat, lon, alt, cfg.radar_lat, cfg.radar_lon, cfg.radar_alt_m)
+        nan = np.full(len(df), np.nan)
+        anchor_e = anchor_n = anchor_u = delta_e = delta_n = delta_u = nan
 
     ground_range = np.hypot(east, north)
     rng = np.sqrt(east**2 + north**2 + up**2)
@@ -221,6 +334,18 @@ def make_radar_truth_for_day(date: str, input_path: str, output_dir: str, cfg: R
         "trajectory_end_time": df["trajectory_end_time"],
         "trajectory_duration_s": df["trajectory_duration_s"],
         "n_samples": df["n_samples"],
+        # Relocation provenance: original geography always kept; anchor/delta
+        # columns are NaN when relocation is off.
+        "relocated": 1 if cfg.relocate else 0,
+        "original_lat_deg": original_lat,
+        "original_lon_deg": original_lon,
+        "original_alt_m": original_alt,
+        "relocation_anchor_east_m": anchor_e,
+        "relocation_anchor_north_m": anchor_n,
+        "relocation_anchor_up_m": anchor_u,
+        "relocation_delta_east_m": delta_e,
+        "relocation_delta_north_m": delta_n,
+        "relocation_delta_up_m": delta_u,
     })[keep].reset_index(drop=True)
 
     out.to_csv(output_path, index=False)
@@ -250,7 +375,7 @@ def summarize_day(day_result: Dict) -> Dict:
 # Validation gate
 # =============================================================================
 
-def run_validation_gate(day_results: List[Dict]) -> None:
+def run_validation_gate(day_results: List[Dict], cfg: RadarTruthConfig) -> None:
     """Post-run checks; raises ValueError with a clear message on failure."""
 
     def fail(message: str) -> None:
@@ -280,6 +405,9 @@ def run_validation_gate(day_results: List[Dict]) -> None:
         "speed_enu_mps", "speed_stage4_mps", "accel_stage4_mps2", "turn_rate_stage4_deg_s",
         "is_interpolated", "trajectory_start_time", "trajectory_end_time",
         "trajectory_duration_s", "n_samples",
+        "relocated", "original_lat_deg", "original_lon_deg", "original_alt_m",
+        "relocation_anchor_east_m", "relocation_anchor_north_m", "relocation_anchor_up_m",
+        "relocation_delta_east_m", "relocation_delta_north_m", "relocation_delta_up_m",
     ]
     for df in frames:
         missing = [c for c in required_out if c not in df.columns]
@@ -317,6 +445,43 @@ def run_validation_gate(day_results: List[Dict]) -> None:
         fail(f"median |speed_enu - speed_stage4| = {median_diff:.2f} m/s exceeds "
              f"{MAX_MEDIAN_SPEED_DIFF_MPS} m/s -- ENU velocity computation is likely broken")
 
+    # Relocation contract checks (only when relocation was enabled).
+    if cfg.relocate:
+        lo = cfg.relocate_min_ground_range_m
+        hi = cfg.relocate_max_ground_range_m
+        anchor_ranges = []
+        for r in created:
+            df = r["_final_df"]
+            if df is None or df.empty:
+                continue
+            if not (df["relocated"] == 1).all():
+                fail(f"{r['date']}: relocation enabled but some rows have relocated != 1")
+            for col in ("original_lat_deg", "original_lon_deg", "original_alt_m",
+                        "relocation_anchor_east_m", "relocation_anchor_north_m",
+                        "relocation_anchor_up_m"):
+                if not np.isfinite(df[col].to_numpy()).all():
+                    fail(f"{r['date']}: {col} contains non-finite values")
+            # Anchor ground range == the trajectory's first-point ground range
+            # (deltas are zero at the first point), and anchors are constant
+            # per trajectory -- so this check is immune to row filtering.
+            first = df.groupby("trajectory_id", sort=False)[
+                ["relocation_anchor_east_m", "relocation_anchor_north_m"]].first()
+            agr = np.hypot(first["relocation_anchor_east_m"], first["relocation_anchor_north_m"])
+            if not ((agr >= lo - 1e-6) & (agr <= hi + 1e-6)).all():
+                fail(f"{r['date']}: relocated first-point ground range outside "
+                     f"[{lo:.0f}, {hi:.0f}] m (min {agr.min():.0f}, max {agr.max():.0f})")
+            anchor_ranges.append(agr.to_numpy())
+        print(f"  relocation: relocated==1, original geography finite, anchors finite,")
+        print(f"  first-point ground range within [{lo:.0f}, {hi:.0f}] m: OK")
+        p50, p95, p99 = np.percentile(np.concatenate(anchor_ranges), [50, 95, 99])
+        print(f"  relocated first-point ground range p50/p95/p99: "
+              f"{p50:.0f} / {p95:.0f} / {p99:.0f} m (report-only)")
+    else:
+        for r in created:
+            df = r["_final_df"]
+            if df is not None and not df.empty and not (df["relocated"] == 0).all():
+                fail(f"{r['date']}: relocation disabled but some rows have relocated != 0")
+
     channels = {
         "range_m": np.concatenate([f["range_m"].to_numpy() for f in frames]),
         "ground_range_m": np.concatenate([f["ground_range_m"].to_numpy() for f in frames]),
@@ -324,7 +489,8 @@ def run_validation_gate(day_results: List[Dict]) -> None:
         "speed_enu (m/s)": speed_enu,
         "elevation (deg)": np.concatenate([f["elevation_deg"].to_numpy() for f in frames]),
     }
-    print("\n  combined statistics (report-only):")
+    label = "relocated " if cfg.relocate else ""
+    print(f"\n  combined {label}statistics (report-only):")
     print(f"  {'channel':>24} | {'p50':>12} | {'p95':>12} | {'p99':>12}")
     for name, values in channels.items():
         p50, p95, p99 = np.nanpercentile(values, [50, 95, 99])
@@ -379,7 +545,62 @@ def self_test() -> None:
         assert np.allclose(out["speed_enu_mps"], 50.0, atol=1.0), \
             f"speed_enu {out['speed_enu_mps'].tolist()} != ~50"
         assert out["range_m"].iloc[-1] > out["range_m"].iloc[0], "range should grow flying away"
+        assert (out["relocated"] == 0).all(), "relocation off but relocated != 0"
+        assert out["relocation_anchor_east_m"].isna().all(), "relocation off but anchors not NaN"
 
-        run_validation_gate([result])
+        run_validation_gate([result], cfg)
+        print("\nStage 05 self-test passed.")
 
-    print("\nStage 05 self-test passed.")
+        # --- relocation branch: same motion, but planted ~7,000 km away ---
+        far = rows.copy()
+        for c in ("lon_interp", "lon_smooth"):
+            far[c] = far[c] + 93.0            # ~100E vs the 7E radar
+        in2 = os.path.join(tmp, "in2")
+        out2 = os.path.join(tmp, "out2")
+        out3 = os.path.join(tmp, "out3")
+        for d in (in2, out2, out3):
+            os.makedirs(d)
+        far.to_csv(os.path.join(in2, f"{INPUT_PREFIX}2022-01-02{INPUT_SUFFIX}"), index=False)
+        (date2, path2), = discover_input_files(in2)
+
+        # Without relocation the trajectory is genuinely far from the radar.
+        res_far = make_radar_truth_for_day(date2, path2, out2, cfg)
+        assert res_far["_final_df"]["range_m"].min() > 5_000_000, \
+            "far trajectory should be thousands of km away without relocation"
+
+        cfg_reloc = RadarTruthConfig(
+            radar_lat=radar_lat, radar_lon=radar_lon, radar_alt_m=radar_alt,
+            relocate=True, relocate_seed=123,
+            relocate_min_ground_range_m=20_000.0, relocate_max_ground_range_m=30_000.0)
+        res_rel = make_radar_truth_for_day(date2, path2, out3, cfg_reloc)
+        rel = res_rel["_final_df"]
+
+        assert os.path.exists(res_rel["output_file"]), "relocated output file was not written"
+        assert (rel["relocated"] == 1).all(), "relocated flag not set"
+        assert np.allclose(rel["original_lon_deg"], far["lon_smooth"], atol=1e-9) \
+            and np.allclose(rel["original_lat_deg"], far["lat_smooth"], atol=1e-9) \
+            and np.allclose(rel["original_alt_m"], far["alt_smooth"], atol=1e-9), \
+            "original geography not preserved"
+        first = rel[rel["sample_idx"] == 0]
+        gr0 = np.hypot(first["east_m"], first["north_m"])
+        assert ((gr0 >= 20_000 - 1e-6) & (gr0 <= 30_000 + 1e-6)).all(), \
+            f"first-point ground range {gr0.tolist()} outside [20km, 30km]"
+        # motion preserved: still ~50 m/s eastbound after relocation
+        assert np.allclose(rel["speed_enu_mps"], 50.0, atol=1.5), \
+            f"relocated speed_enu {rel['speed_enu_mps'].tolist()} != ~50"
+        assert (rel["range_m"] >= 0).all() and np.isfinite(rel["range_m"]).all(), "bad relocated range"
+        assert ((rel["azimuth_rad"] >= 0) & (rel["azimuth_rad"] < 2 * np.pi)).all(), \
+            "relocated azimuth out of bounds"
+        assert rel["elevation_rad"].between(-np.pi / 2, np.pi / 2).all(), \
+            "relocated elevation out of bounds"
+        # synthetic geodetic coordinates should now be near the radar
+        assert (np.abs(rel["lat_deg"] - radar_lat) < 1.0).all() \
+            and (np.abs(rel["lon_deg"] - radar_lon) < 1.0).all(), \
+            "synthetic lat/lon not near the radar"
+        # preserve mode: up equals original altitude above radar
+        assert np.allclose(rel["up_m"], rel["original_alt_m"] - radar_alt, atol=1e-9), \
+            "preserve mode should give up = original_alt - radar_alt"
+
+        run_validation_gate([res_rel], cfg_reloc)
+
+    print("\nStage 05 relocation self-test passed.")
