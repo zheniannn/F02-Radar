@@ -1,7 +1,9 @@
 # Data files are never committed -- only the directory structure (.gitkeep).
 data/active/trajectories_10s/*.csv
 data/active/radar_truth/*.csv
+data/active/radar_truth_relocated/*.csv
 data/active/sim_detections/*.csv
+data/active/sim_detections_relocated/*.csv
 data/raw/
 data/interim/
 data/processed/

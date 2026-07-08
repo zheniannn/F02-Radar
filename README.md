@@ -358,6 +358,75 @@ moderate clutter into a temporary directory, and asserts output existence,
 sane Pd/clutter ordering across thresholds, column completeness, valid
 labels, and bounded measurements. No real data is touched.
 
+---
+
+# Relocated wide-area weak-target experiment
+
+The current main experiment is a **wide-area weak-target experiment — not a
+range-contained radar-coverage experiment**. Understanding that distinction
+is essential to interpreting the outputs:
+
+- Aircraft trajectories are synthetically **anchored near the radar at
+  their first sample** (ground range uniform in 10–80 km, bearing uniform).
+- After the first sample, each aircraft follows its **original
+  ADS-B-derived motion** unchanged — so long trajectories drift well beyond
+  the anchor band (p95 sample range ≈ 194 km, p99 ≈ 359 km in the current
+  dataset).
+- Stage 6's `--max-range-m 100000` controls the **spatial support of
+  clutter generation only**. It does **not** remove target truth rows
+  outside 100 km.
+- Farther targets remain in the dataset and naturally receive **lower SNR
+  through the range-decay model**, becoming weak targets rather than being
+  cut. This is intentional.
+- This setup is suitable for studying **threshold trade-offs and
+  weak-target tracking over long trajectories**. A future range-contained
+  experiment would require stage-5 post-relocation target filtering or a
+  stage-6 target-range gate — neither exists today, by design.
+
+Commands used for the current dataset:
+
+```bash
+# Stage 05 relocated truth
+python scripts/05_make_radar_truth.py \
+  --radar-lat 38.966 \
+  --radar-lon -86.999 \
+  --radar-alt-m 200 \
+  --radar-name centroid \
+  --relocate-near-radar \
+  --relocate-min-ground-range-m 10000 \
+  --relocate-max-ground-range-m 80000 \
+  --output-dir data/active/radar_truth_relocated \
+  --overwrite
+
+# Stage 06 relocated detections
+python scripts/06_simulate_radar_detections.py \
+  --input-dir data/active/radar_truth_relocated \
+  --output-dir data/active/sim_detections_relocated \
+  --scenario-id relocated \
+  --threshold-db -5 0 3 6 9 12 \
+  --snr-model range_decay \
+  --target-snr-ref-db 8 \
+  --snr-ref-range-m 50000 \
+  --target-snr-std-db 3 \
+  --sigma-range-m 75 \
+  --sigma-azimuth-deg 0.15 \
+  --sigma-elevation-deg 0.15 \
+  --sigma-radial-velocity-mps 2 \
+  --clutter-rate-ref 20 \
+  --max-range-m 100000 \
+  --overwrite
+```
+
+A read-only audit of this experiment (truth statistics, threshold sweep,
+coverage-range fractions, stage-7 notes) can be regenerated any time with:
+
+```bash
+python scripts/06_audit_relocated_experiment.py
+```
+
+which writes `reports/relocated_experiment_audit.md`
+(`--self-test` available; see the script docstring for flags).
+
 ## Extending
 
 Stage-5 rules live entirely in `utils/radar_truth.py`, stage-6 rules in
