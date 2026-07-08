@@ -1,12 +1,12 @@
-# F02-RADAR
+# F02-Radar
 
-> **Evaluation moved to F03-Evaluation.** F02-RADAR ends at stage 6
+> **Evaluation moved to F03-Evaluation.** F02-Radar ends at stage 6
 > synthetic radar detections. Use **F03-Evaluation** for stage 7 threshold
 > evaluation and stage 8 tracking baselines (the stage-7 code and reports
 > in this repo are retained for history but maintained in F03).
 
-Radar-side stages of the light-GA motion-prior pipeline. **F02-RADAR starts
-from F01-PREPROCESSING stage 4 outputs**: the uniformly-sampled (10 s grid)
+Radar-side stages of the light-GA motion-prior pipeline. **F02-Radar starts
+from F01-Preprocessing stage 4 outputs**: the uniformly-sampled (10 s grid)
 trajectory CSVs.
 
 Pipeline:
@@ -32,7 +32,7 @@ training, or train/test splitting — those belong to later stages).
 ## Structure
 
 ```
-F02-RADAR/
+F02-Radar/
 ├── scripts/
 │   ├── 05_make_radar_truth.py            # stage 5: 10s trajectories -> radar-coordinate truth
 │   └── 06_simulate_radar_detections.py   # stage 6: truth -> thresholded point detections
@@ -49,7 +49,7 @@ F02-RADAR/
 └── reports/
 ```
 
-## Input contract from F01-PREPROCESSING
+## Input contract from F01-Preprocessing
 
 Required input files (one per day), produced by F01's stage 4:
 
@@ -73,7 +73,7 @@ position-source triple) is missing.
 ## How to copy inputs from F01
 
 ```bash
-cp ../F01-PREPROCESSING/data/active/trajectories_10s/states_*_trajectories_10s.csv data/active/trajectories_10s/
+cp ../F01-Preprocessing/data/active/trajectories_10s/states_*_trajectories_10s.csv data/active/trajectories_10s/
 ```
 
 (Input CSVs are git-ignored; only the directory structure is committed.)
