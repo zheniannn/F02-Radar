@@ -296,6 +296,51 @@ have blank ids and NaN truth. Threshold trends (empirical Pd and false
 alarms per frame should generally decrease with threshold) are printed
 **report-only** — finite random samples may wiggle.
 
+## Using relocated Stage 5 truth
+
+Stage 6 can consume either **true-geography** or **relocated** stage-5 radar
+truth. For the controlled low-SNR radar experiment, relocated truth is
+recommended — every trajectory is then genuinely inside radar coverage.
+Point stage 6 at the relocated directory with
+`--input-dir data/active/radar_truth_relocated`, and pass an **explicit
+`--max-range-m`** (e.g. 100000) so the clutter support is consistent across
+days and thresholds instead of being inferred per day.
+
+Stage 6 reports the input's relocated state per day (`relocated truth
+fraction: 1.000`, or `unavailable (column missing)` for pre-relocation
+truth files) and prints a warning — never a failure — when the input does
+not look fully relocated. The summary CSV records
+`relocated_column_present`, `relocated_truth_fraction`, and
+`max_range_m_used` per (day, threshold).
+
+Target detections **preserve key relocation metadata** (`relocated`,
+`original_lat_deg`/`original_lon_deg`/`original_alt_m`,
+`relocation_anchor_east/north/up_m`) copied from the stage-5 truth row, so
+later tracking/evaluation can trace any detection back to the original
+ADS-B trajectory. Inputs without relocation columns get `relocated = 0` and
+NaN metadata. Clutter rows always carry `relocated = 0` (a false alarm is
+never a relocated aircraft) with all original/anchor columns NaN.
+`relocation_delta_*` columns are deliberately not carried through.
+
+Recommended real-data command:
+
+```bash
+python scripts/06_simulate_radar_detections.py \
+  --input-dir data/active/radar_truth_relocated \
+  --threshold-db -5 0 3 6 9 12 \
+  --snr-model range_decay \
+  --target-snr-ref-db 8 \
+  --snr-ref-range-m 50000 \
+  --target-snr-std-db 3 \
+  --sigma-range-m 75 \
+  --sigma-azimuth-deg 0.15 \
+  --sigma-elevation-deg 0.15 \
+  --sigma-radial-velocity-mps 2 \
+  --clutter-rate-ref 20 \
+  --max-range-m 100000 \
+  --overwrite
+```
+
 ## Usage
 
 ```bash

@@ -86,7 +86,9 @@ def parse_args():
     clut.add_argument("--clutter-threshold-scale-db", type=float, default=6.0)
     clut.add_argument("--max-range-m", type=float, default=None,
                        help="Clutter range upper bound; if omitted, inferred per day from the "
-                            "truth's max range rounded up to the nearest 10 km (printed clearly).")
+                            "truth's max range rounded up to the nearest 10 km (printed clearly). "
+                            "Pass an explicit value for controlled threshold sweeps -- especially "
+                            "on relocated truth -- so clutter support is identical across days.")
     clut.add_argument("--min-range-m", type=float, default=0.0)
     clut.add_argument("--min-elevation-deg", type=float, default=0.0)
     clut.add_argument("--max-elevation-deg", type=float, default=20.0)

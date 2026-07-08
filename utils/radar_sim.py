@@ -43,6 +43,19 @@ REQUIRED_INPUT_COLUMNS = [
 # Stage-5 radar-site columns, carried through when present.
 RADAR_SITE_COLUMNS = ["radar_lat_deg", "radar_lon_deg", "radar_alt_m"]
 
+# Stage-5 relocation metadata carried through on TARGET detections, so later
+# tracking/evaluation can trace a detection back to the original ADS-B
+# trajectory. relocation_delta_* is deliberately not carried -- original
+# position and anchor position are the debugging fields that matter.
+RELOCATION_COLUMNS = [
+    "relocated", "original_lat_deg", "original_lon_deg", "original_alt_m",
+    "relocation_anchor_east_m", "relocation_anchor_north_m", "relocation_anchor_up_m",
+]
+
+# When the fraction of relocated truth rows is below this, warn (never fail --
+# true-geography runs are valid).
+RELOCATED_WARN_FRACTION = 0.99
+
 OUTPUT_COLUMNS = [
     "date", "scenario_id", "threshold_db", "frame_id", "timestamp",
     "detection_id", "is_target",
@@ -53,7 +66,7 @@ OUTPUT_COLUMNS = [
     "range_error_m", "azimuth_error_rad", "elevation_error_rad", "radial_velocity_error_mps",
     "snr_db", "pd", "clutter_density_per_frame",
     "radar_name", "radar_lat_deg", "radar_lon_deg", "radar_alt_m",
-]
+] + RELOCATION_COLUMNS
 
 SUMMARY_COLUMNS = [
     "date", "scenario_id", "threshold_db", "status",
@@ -61,6 +74,7 @@ SUMMARY_COLUMNS = [
     "target_detections", "missed_targets", "empirical_pd",
     "clutter_detections", "total_detections", "false_alarm_per_frame",
     "median_snr_target_db", "p10_snr_target_db", "p90_snr_target_db",
+    "relocated_column_present", "relocated_truth_fraction", "max_range_m_used",
     "output_file",
 ]
 
@@ -143,14 +157,16 @@ def derive_seed(base_seed: int, date: str, threshold_db: float, scenario_id: str
     return int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
 
 
-def validate_input_columns(path: str) -> bool:
-    """Check the stage-5 required columns; return whether the radar-site
-    lat/lon/alt columns are also present (they are carried through)."""
+def validate_input_columns(path: str) -> Tuple[bool, List[str]]:
+    """Check the stage-5 required columns. Returns (has_radar_site_columns,
+    relocation_columns_present) -- both are optional carried-through groups."""
     columns = list(pd.read_csv(path, nrows=0).columns)
     missing = [c for c in REQUIRED_INPUT_COLUMNS if c not in columns]
     if missing:
         raise ValueError(f"Missing required stage-5 column(s) {missing} in {path}")
-    return all(c in columns for c in RADAR_SITE_COLUMNS)
+    has_site = all(c in columns for c in RADAR_SITE_COLUMNS)
+    reloc_present = [c for c in RELOCATION_COLUMNS if c in columns]
+    return has_site, reloc_present
 
 
 # =============================================================================
@@ -242,6 +258,13 @@ def simulate_target_detections(
         "snr_db": snr[detected],
         "pd": pd_vals[detected],
     })
+    # Relocation metadata: copied from the truth row when stage 5 provided it;
+    # otherwise relocated = 0 (true geography) and the rest NaN.
+    for col in RELOCATION_COLUMNS:
+        if col in d.columns:
+            out[col] = d[col].to_numpy()
+        else:
+            out[col] = 0 if col == "relocated" else np.nan
     return out, n - n_detected
 
 
@@ -285,6 +308,10 @@ def simulate_clutter_for_day(
         "radial_velocity_error_mps": np.nan,
         "snr_db": threshold_db + rng.exponential(cfg.clutter_snr_scale_db, total),
         "pd": np.nan,
+        # Clutter has no original geography: relocated is 0 by convention
+        # (a false alarm is never a relocated aircraft), anchors/originals NaN.
+        "relocated": 0,
+        **{col: np.nan for col in RELOCATION_COLUMNS if col != "relocated"},
     })
     return out, float(lam)
 
@@ -292,11 +319,12 @@ def simulate_clutter_for_day(
 def simulate_day(date: str, input_path: str, output_dir: str, cfg: RadarSimConfig) -> List[Dict]:
     """Simulate every configured threshold for one day's truth file.
     Returns one summary dict per threshold (status 'created' or 'skipped')."""
-    has_site = validate_input_columns(input_path)
+    has_site, reloc_cols = validate_input_columns(input_path)
 
     usecols = ["icao24", "trajectory_id", "source_segment_id", "sample_idx", "timestamp",
                "range_m", "azimuth_rad", "elevation_rad", "radial_velocity_mps", "radar_name"]
     usecols += RADAR_SITE_COLUMNS if has_site else []
+    usecols += reloc_cols
     id_cols = ["icao24", "trajectory_id", "source_segment_id"]
     # Chunked read + categorical ids keep peak memory well under the naive
     # single-shot parse (the id strings dominate an object-dtype frame).
@@ -318,12 +346,26 @@ def simulate_day(date: str, input_path: str, output_dir: str, cfg: RadarSimConfi
                            "timestamp": unique_bins.astype(float) * cfg.frame_period_s})
     df_truth["frame_id"] = np.searchsorted(unique_bins, bins)
 
+    # Relocated-truth reporting: warn (never fail) when the input doesn't look
+    # fully relocated -- true-geography runs are still valid.
+    relocated_col_present = "relocated" in df_truth.columns
+    if relocated_col_present:
+        relocated_fraction = float((df_truth["relocated"] == 1).mean())
+        print(f"[{date}] relocated truth fraction: {relocated_fraction:.3f}")
+        if relocated_fraction < RELOCATED_WARN_FRACTION:
+            print(f"[{date}] WARNING: input radar truth does not appear to be fully relocated. "
+                  f"If this experiment assumes all aircraft are near the radar, rerun Stage 05 "
+                  f"with --relocate-near-radar or pass the relocated truth directory via --input-dir.")
+    else:
+        relocated_fraction = float("nan")
+        print(f"[{date}] relocated truth fraction: unavailable (column missing)")
+
     if cfg.max_range_m is not None:
         max_range_m = float(cfg.max_range_m)
     else:
         max_range_m = float(np.ceil(df_truth["range_m"].max() / 10_000.0) * 10_000.0)
-        print(f"[{date}] --max-range-m not provided: inferred {max_range_m:.0f} m "
-              f"from the day's truth (max range rounded up to nearest 10 km)")
+        print(f"[{date}] max_range_m not provided; inferred clutter support max range "
+              f"for {date}: {max_range_m:.1f} m (day's max truth range rounded up to 10 km)")
 
     radar_name = df_truth["radar_name"].iloc[0]
     radar_lat = float(df_truth["radar_lat_deg"].iloc[0]) if has_site else np.nan
@@ -346,6 +388,9 @@ def simulate_day(date: str, input_path: str, output_dir: str, cfg: RadarSimConfi
                             "total_detections": None, "false_alarm_per_frame": None,
                             "median_snr_target_db": None, "p10_snr_target_db": None,
                             "p90_snr_target_db": None,
+                            "relocated_column_present": relocated_col_present,
+                            "relocated_truth_fraction": relocated_fraction,
+                            "max_range_m_used": max_range_m,
                             "output_file": os.path.abspath(output_path)})
             continue
 
@@ -390,6 +435,9 @@ def simulate_day(date: str, input_path: str, output_dir: str, cfg: RadarSimConfi
             "median_snr_target_db": float(np.median(target_snr)) if n_targets else float("nan"),
             "p10_snr_target_db": float(np.percentile(target_snr, 10)) if n_targets else float("nan"),
             "p90_snr_target_db": float(np.percentile(target_snr, 90)) if n_targets else float("nan"),
+            "relocated_column_present": relocated_col_present,
+            "relocated_truth_fraction": relocated_fraction,
+            "max_range_m_used": max_range_m,
             "output_file": os.path.abspath(output_path),
         })
     return results
@@ -403,7 +451,7 @@ _GATE_USECOLS = [
     "is_target", "trajectory_id",
     "truth_range_m", "meas_range_m", "meas_azimuth_rad", "meas_elevation_rad", "snr_db",
     "range_error_m", "azimuth_error_rad", "elevation_error_rad", "radial_velocity_error_mps",
-]
+] + RELOCATION_COLUMNS
 
 
 def run_validation_gate(output_paths: List[str], summary_df: pd.DataFrame) -> None:
@@ -464,13 +512,29 @@ def run_validation_gate(output_paths: List[str], summary_df: pd.DataFrame) -> No
                         "elevation_error_rad", "radial_velocity_error_mps"]:
                 if not np.isfinite(tgt[col].to_numpy()).all():
                     fail(f"{name}: target rows with non-finite {col}")
+            # Relocation contract: relocated present/finite on targets; when
+            # relocated == 1, the original geography must be traceable. All
+            # targets having relocated == 0 is fine (true-geography run).
+            rel = tgt["relocated"].to_numpy()
+            if not np.isfinite(rel).all():
+                fail(f"{name}: target rows with missing/non-finite relocated flag")
+            relocated_targets = tgt[rel == 1]
+            if len(relocated_targets):
+                for col in ["original_lat_deg", "original_lon_deg", "original_alt_m"]:
+                    if not np.isfinite(relocated_targets[col].to_numpy()).all():
+                        fail(f"{name}: relocated target rows with non-finite {col}")
         clu = df[~is_target]
         if len(clu):
             if not clu["trajectory_id"].isna().all():
                 fail(f"{name}: clutter rows with a non-blank trajectory_id")
             if not clu["truth_range_m"].isna().all():
                 fail(f"{name}: clutter rows with finite truth_range_m")
-    print(f"  per-file label/bounds/finiteness checks over {len(output_paths)} file(s): OK")
+            for col in ["original_lat_deg", "original_lon_deg", "original_alt_m",
+                        "relocation_anchor_east_m", "relocation_anchor_north_m",
+                        "relocation_anchor_up_m"]:
+                if not clu[col].isna().all():
+                    fail(f"{name}: clutter rows with non-NaN {col}")
+    print(f"  per-file label/bounds/finiteness/relocation checks over {len(output_paths)} file(s): OK")
 
     # Report-only monotonic-trend check (finite random samples may wiggle).
     created = summary_df[summary_df["status"] == "created"]
@@ -515,6 +579,11 @@ def self_test() -> None:
                 "speed_enu_mps": 60.0, "speed_stage4_mps": 60.0, "is_interpolated": False,
                 "trajectory_start_time": t[0], "trajectory_end_time": t[-1],
                 "trajectory_duration_s": 40.0, "n_samples": 5,
+                # stage-5 relocation metadata, as written by --relocate-near-radar
+                "relocated": 1,
+                "original_lat_deg": -12.34, "original_lon_deg": 130.5, "original_alt_m": 900.0,
+                "relocation_anchor_east_m": 15_000.0, "relocation_anchor_north_m": 12_000.0,
+                "relocation_anchor_up_m": 700.0,
             })
 
     # Third trajectory with per-trajectory-anchored (misaligned) timestamps,
@@ -564,6 +633,21 @@ def self_test() -> None:
         assert tgt["trajectory_id"].notna().all(), "target row lost its trajectory_id"
         assert out.loc[out["is_target"] == 0, "truth_range_m"].isna().all(), \
             "clutter row has truth range"
+
+        # Relocation metadata pass-through
+        clu = out[out["is_target"] == 0]
+        assert (tgt["relocated"] == 1).all(), "target rows lost relocated == 1"
+        for col in ["original_lat_deg", "original_lon_deg", "original_alt_m",
+                    "relocation_anchor_east_m", "relocation_anchor_north_m",
+                    "relocation_anchor_up_m"]:
+            assert np.isfinite(tgt[col].to_numpy()).all(), f"target rows lost finite {col}"
+            assert clu[col].isna().all(), f"clutter rows have non-NaN {col}"
+        assert np.allclose(tgt["original_lat_deg"], -12.34), "original_lat_deg value corrupted"
+        for col in ["relocated_column_present", "relocated_truth_fraction", "max_range_m_used"]:
+            assert col in summary.columns, f"summary missing {col}"
+        assert bool(summary["relocated_column_present"].iloc[0]) is True
+        assert float(summary["relocated_truth_fraction"].iloc[0]) == 1.0
+        assert float(summary["max_range_m_used"].iloc[0]) == 60_000.0
 
         run_validation_gate([r["output_file"] for r in results], summary)
 
