@@ -1,5 +1,10 @@
 # F02-RADAR
 
+> **Evaluation moved to F03-Evaluation.** F02-RADAR ends at stage 6
+> synthetic radar detections. Use **F03-Evaluation** for stage 7 threshold
+> evaluation and stage 8 tracking baselines (the stage-7 code and reports
+> in this repo are retained for history but maintained in F03).
+
 Radar-side stages of the light-GA motion-prior pipeline. **F02-RADAR starts
 from F01-PREPROCESSING stage 4 outputs**: the uniformly-sampled (10 s grid)
 trajectory CSVs.
