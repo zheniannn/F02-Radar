@@ -1,5 +1,7 @@
 # F02-Radar
 
+> Part of the PLSWORK light-GA radar pipeline: [F01-Preprocessing](https://github.com/zheniannn/F01-Preprocessing) (stages 1-4) → [F02-Radar](https://github.com/zheniannn/F02-Radar) (stages 5-6) → [F03-Evaluation](https://github.com/zheniannn/F03-Evaluation) (stages 7-9).
+
 > **Evaluation moved to F03-Evaluation.** F02-Radar ends at stage 6
 > synthetic radar detections. Use **F03-Evaluation** for stage 7 threshold
 > evaluation and stage 8 tracking baselines (the stage-7 code and reports
