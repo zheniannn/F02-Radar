@@ -2,10 +2,11 @@
 
 > Part of the PLSWORK light-GA radar pipeline: [F01-Preprocessing](https://github.com/zheniannn/F01-Preprocessing) (stages 1-4) → [F02-Radar](https://github.com/zheniannn/F02-Radar) (stages 5-6) → [F03-Evaluation](https://github.com/zheniannn/F03-Evaluation) (stages 7-9).
 
-> **Evaluation moved to F03-Evaluation.** F02-Radar ends at stage 6
-> synthetic radar detections. Use **F03-Evaluation** for stage 7 threshold
-> evaluation and stage 8 tracking baselines (the stage-7 code and reports
-> in this repo are retained for history but maintained in F03).
+> **Evaluation lives in F03-Evaluation.** F02-Radar ends at stage 6
+> synthetic radar detections. The stage-7 evaluation and audit code that
+> originated here has moved to
+> [F03-Evaluation](https://github.com/zheniannn/F03-Evaluation) and was
+> removed from this repo (git history preserves it).
 
 Radar-side stages of the light-GA motion-prior pipeline. **F02-Radar starts
 from F01-Preprocessing stage 4 outputs**: the uniformly-sampled (10 s grid)
@@ -425,56 +426,15 @@ python scripts/06_simulate_radar_detections.py \
 ```
 
 A read-only audit of this experiment (truth statistics, threshold sweep,
-coverage-range fractions, stage-7 notes) can be regenerated any time with:
-
-```bash
-python scripts/06_audit_relocated_experiment.py
-```
-
-which writes `reports/relocated_experiment_audit.md`
-(`--self-test` available; see the script docstring for flags).
+coverage-range fractions) lives in
+[F03-Evaluation](https://github.com/zheniannn/F03-Evaluation)
+(`scripts/06_audit_relocated_experiment.py`, report at
+`reports/relocated_experiment_audit.md`).
 
 ---
-
-# Stage 7 — Threshold-only baseline evaluation
-
-Evaluates the detection trade-off produced by the stage-6 threshold sweep:
-low thresholds recover more targets but admit more clutter; high thresholds
-suppress clutter but miss weak targets. **This is not tracking** — no data
-association, Kalman filtering, or trajectory smoothing happens here;
-detections are scored frame-by-frame against stage-5 truth. **Stage 8 will
-add tracking** (a low-threshold detect-then-track baseline with a
-constant-velocity Kalman filter and gating, before any ML model).
-
-- **Inputs:** stage-5 truth (`radar_truth_YYYY-MM-DD.csv`), stage-6
-  detections (`detections_YYYY-MM-DD_thr_*dB.csv`), and the stage-6
-  summary when present (authoritative frame counts).
-- **Outputs** (`reports/stage07_threshold_only/`): per-day and overall
-  operating-curve tables, Pd by truth range bin, clutter by measured range
-  bin, SNR summaries of written detections (not Pd-by-SNR — stage 6 writes
-  no missed-target rows), measurement-error sanity checks,
-  `threshold_only_report.md`, and four matplotlib plots. Counts/Pd/false
-  alarms are exact; only SNR/error quantiles use a capped deterministic
-  sample (documented in the report).
-
-```bash
-python scripts/07_evaluate_threshold_only.py \
-  --truth-dir data/active/radar_truth_relocated \
-  --detections-dir data/active/sim_detections_relocated \
-  --output-dir reports/stage07_threshold_only \
-  --coverage-range-m 100000 \
-  --range-bins-m 0,50000,100000,200000,inf \
-  --chunksize 1000000 \
-  --overwrite
-```
-
-`--self-test` runs a tiny synthetic end-to-end check; `--no-plots` skips
-PNG generation. All reads are chunked — the 17 GB detection set is never
-loaded into memory.
 
 ## Extending
 
 Stage-5 rules live entirely in `utils/radar_truth.py`, stage-6 rules in
-`utils/radar_sim.py`, stage-7 evaluation in `utils/threshold_eval.py`; the
-WGS84 math is isolated in `utils/geo.py`. `io.py` and the entry-point
+`utils/radar_sim.py`; the WGS84 math is isolated in `utils/geo.py`. `io.py` and the entry-point
 scripts only need to change if the underlying file/folder layout changes.
